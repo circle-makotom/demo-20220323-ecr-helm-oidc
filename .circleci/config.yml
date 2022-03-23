@@ -1,0 +1,252 @@
+version: 2.1
+
+commands:
+  configure-oidc-for-aws-cli:
+    parameters:
+      file-pointer-var:
+        type: string
+        default: AWS_WEB_IDENTITY_TOKEN_FILE
+      aws-role-arn:
+        type: string
+    steps:
+      - run:
+          name: Make a real temporary filename for << parameters.file-pointer-var >>
+          command: echo "export ${FILE_POINTER_VAR}='$(mktemp -u)'" | tee -a "${BASH_ENV}"
+          environment:
+            FILE_POINTER_VAR: << parameters.file-pointer-var >>
+      - run:
+          name: Write CIRCLE_OIDC_TOKEN to the file pointed by << parameters.file-pointer-var >>
+          command: printenv CIRCLE_OIDC_TOKEN > "$(eval printenv "${FILE_POINTER_VAR}")"
+          environment:
+            FILE_POINTER_VAR: << parameters.file-pointer-var >>
+      - run:
+          name: Set AWS_ROLE_ARN
+          command: echo "export AWS_ROLE_ARN='${AWS_ROLE_ARN}'" | tee -a "${BASH_ENV}"
+          environment:
+            AWS_ROLE_ARN: << parameters.aws-role-arn >>
+
+  configure-ecr-credentials:
+    parameters:
+      aws-account-id:
+        type: string
+      aws-region:
+        type: string
+      aws-role-arn:
+        type: string
+    steps:
+      - configure-oidc-for-aws-cli:
+          aws-role-arn: << parameters.aws-role-arn >>
+      - run:
+          name: Get a token for ECR and pass it to Docker CLI
+          command: |
+            aws ecr get-login-password --region "${ECR_REGION}" | docker login -u AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com"
+          environment:
+            AWS_ACCOUNT_ID: << parameters.aws-account-id >>
+            ECR_REGION: << parameters.aws-region >>
+
+  install-kube-toolchain:
+    steps:
+      - run:
+          name: Install cURL
+          command: |
+            apt update
+            apt install -y curl
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+      - run:
+          name: Install kubectl
+          working_directory: tmp
+          command: |
+            curl -fsSJLO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            echo "$(curl -fsSJL "https://dl.k8s.io/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl.sha256")" kubectl | sha256sum --check
+            install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      - run:
+          name: Install Helm
+          working_directory: tmp
+          command: |
+            curl -fsSJL https://get.helm.sh/helm-v3.7.1-linux-amd64.tar.gz | tar -xz
+            install -o root -g root -m 0755 linux-amd64/helm /usr/local/bin/helm
+
+  setup-kubeconfig:
+    parameters:
+      eks-cluster-name:
+        type: string
+      aws-region:
+        type: string
+      aws-role-arn:
+        type: string
+    steps:
+      - run:
+          name: Install AWS CLI
+          command: |
+            apt update
+            apt install -y awscli
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+      - configure-oidc-for-aws-cli:
+          aws-role-arn: << parameters.aws-role-arn >>
+      - run:
+          command: aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+          environment:
+            EKS_CLUSTER_NAME: << parameters.eks-cluster-name >>
+            AWS_REGION: << parameters.aws-region >>
+
+jobs:
+  prepare-dependencies:
+    docker:
+      - image: node:current-slim
+    steps:
+      - checkout
+      - run:
+          name: Compute version number
+          command: echo "0.0.${CIRCLE_BUILD_NUM}-${CIRCLE_SHA1:0:7}" | tee version.txt
+      - restore_cache:
+          keys:
+            - yarn-deps-{{ checksum "yarn.lock" }}
+            - yarn-deps
+      - run:
+          name: yarn install
+          command: yarn install
+      - save_cache:
+          paths:
+            - node_modules
+          key: yarn-deps-{{ checksum "yarn.lock" }}-{{ epoch }}
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  build:
+    docker:
+      - image: node:current-slim
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: yarn build
+          command: |
+            export __BUILD_VERSION=$(cat version.txt)
+
+            if [ -z "$__BUILD_VERSION" ]
+            then
+              echo Build version is not specified.
+              exit 1
+            fi
+
+            yarn build
+      - store_artifacts:
+          path: dist/server.js
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  unit-tests:
+    docker:
+      - image: node:current-slim
+    parallelism: 2
+    resource_class: large
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Run tests
+          command: |
+            circleci tests glob '**/*.test.ts' | circleci tests split --split-by timings | xargs yarn test:ci
+      - store_artifacts:
+          path: test-results
+      - store_test_results:
+          path: test-results
+
+  publish-to-ecr-with-oidc:
+    machine:
+      image: ubuntu-2004:current
+      docker_layer_caching: true
+    parameters:
+      aws-account-id:
+        type: string
+      aws-region:
+        type: string
+      image-name:
+        type: string
+      aws-role-arn:
+        type: string
+    environment:
+      IMAGE_FULL_NAME_TEMPLATE: << parameters.aws-account-id >>.dkr.ecr.<< parameters.aws-region >>.amazonaws.com/<< parameters.image-name >>:${__BUILD_VERSION}
+    steps:
+      - attach_workspace:
+          at: .
+      - configure-ecr-credentials:
+          aws-account-id: << parameters.aws-account-id >>
+          aws-region: << parameters.aws-region >>
+          aws-role-arn: << parameters.aws-role-arn >>
+      - run:
+          name: Configuring build version
+          command: |
+            echo "export export __BUILD_VERSION='$(cat version.txt)'" | tee -a $BASH_ENV
+      - run: docker build -t "$(eval echo "${IMAGE_FULL_NAME_TEMPLATE}")" .
+      - run: docker push "$(eval echo "${IMAGE_FULL_NAME_TEMPLATE}")"
+
+  deploy-helm-eks:
+    docker:
+      - image: ubuntu:rolling
+    parameters:
+      eks-cluster-name:
+        type: string
+      aws-region:
+        type: string
+      aws-role-arn:
+        type: string
+    steps:
+      - attach_workspace:
+          at: .
+
+      - install-kube-toolchain
+      - setup-kubeconfig:
+          eks-cluster-name: << parameters.eks-cluster-name >>
+          aws-region: << parameters.aws-region >>
+          aws-role-arn: << parameters.aws-role-arn >>
+
+      - run:
+          name: Deploy with Helm
+          working_directory: charts
+          command: |
+            K8S_NS="go-to-green"
+            BUILD_VERSION="$(cat ../version.txt)"
+            HELM_CMD="helm upgrade"
+
+            if [ $(helm list -q -n "${K8S_NS}" | wc -l) -eq 0 ]
+            then
+              HELM_CMD="helm install --create-namespace"
+            fi
+
+            eval "${HELM_CMD}" -n "${K8S_NS}" --set images.name.app.tag="'${BUILD_VERSION}'" go-to-green .
+
+workflows:
+  run:
+    jobs:
+      - prepare-dependencies
+      - build:
+          requires:
+            - prepare-dependencies
+      - publish-to-ecr-with-oidc:
+          requires:
+            - build
+          context:
+            - makotom-only
+          aws-account-id: "660990364978"
+          aws-region: ap-northeast-1
+          image-name: makotom/go-to-green
+          aws-role-arn: arn:aws:iam::660990364978:role/makoto
+      - unit-tests:
+          requires:
+            - prepare-dependencies
+      - deploy-helm-eks:
+          requires:
+            - publish-to-ecr-with-oidc
+            - unit-tests
+          context:
+            - makotom-only
+          eks-cluster-name: makoto-workbench
+          aws-region: ap-northeast-1
+          aws-role-arn: arn:aws:iam::660990364978:role/makoto
